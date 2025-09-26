@@ -1,0 +1,3 @@
+models_to_evaluate:
+  - opus_mt
+  - qwen_distill
