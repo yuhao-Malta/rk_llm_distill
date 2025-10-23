@@ -1,0 +1,21 @@
+目录结构: E:/PycharmProjects/rk_llm_distill/data/raw/wmt19_zh_en
+==================================================
+
+E:/PycharmProjects/rk_llm_distill/data/raw/wmt19_zh_en/
+    ├── train/
+        ├── train-00000-of-00013.parquet
+        ├── train-00001-of-00013_2.parquet
+        ├── train-00002-of-00013.parquet
+        ├── train-00003-of-00013.parquet
+        ├── train-00004-of-00013.parquet
+        ├── train-00005-of-00013.parquet
+        ├── train-00006-of-00013.parquet
+        ├── train-00007-of-00013.parquet
+        ├── train-00008-of-00013.parquet
+        ├── train-00009-of-00013.parquet
+        ├── train-00010-of-00013.parquet
+        ├── train-00011-of-00013.parquet
+        ├── train-00012-of-00013.parquet
+    ├── validation/
+        ├── validation-00000-of-00001.parquet
+    ├── dataset_info.json
