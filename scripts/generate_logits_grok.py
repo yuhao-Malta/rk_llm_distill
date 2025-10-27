@@ -1,7 +1,11 @@
 import os
+import sys
 import torch
-import psutil  # 添加内存监控
+import psutil
 import json
+import gc
+
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
@@ -10,6 +14,13 @@ import argparse
 import logging
 import time
 
+# 添加项目根目录到路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config.config import (
+    ModelConfig, DataFormat, LogConfig,
+    MODEL_PATH, TEACHER_LOGITS_DIR, RAW_DATA_PATH
+)
+
 try:
     import dashscope
 except ImportError:
@@ -17,22 +28,16 @@ except ImportError:
 
 # 配置日志
 logging.basicConfig(
-    level=logging.DEBUG,  # 提高日志级别
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    format=LogConfig.LOG_FORMAT,
     handlers=[
-        logging.FileHandler("logs/generate_logits.log", encoding='utf-8'),
+        logging.FileHandler(LogConfig.GENERATE_LOG, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
-# 项目根目录
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "qwen_tokenizer_offline", "qwen", "Qwen1___5-1___8B")
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "teacher_logits")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# 配置DashScope API Key（替换为您的真实Key）
-DASHSCOPE_API_KEY = "sk-b0c78a77e5ea489b8c68e0b5049204c6"  # 请替换！
+# DashScope API Key
+DASHSCOPE_API_KEY = "sk-b0c78a77e5ea489b8c68e0b5049204c6"  # 请替换
 
 
 # 检查模型文件
@@ -115,14 +120,21 @@ def call_qwen_translate_local(model, tokenizer, text, target_lang="en", max_seq_
         outputs = model(**inputs)
     return outputs.logits  # 返回logits
 
+
 # 自定义数据集类
 class TranslationDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_seq_len=64, src_lang="zh", tgt_lang="en"):
+    """
+    翻译数据集（统一格式）
+    输出字段严格遵循 DataFormat.REQUIRED_KEYS
+    """
+
+    def __init__(self, dataset, tokenizer, max_seq_len=64, src_lang="zh", tgt_lang="en", task_id=0):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
+        self.task_id = task_id
 
     def __len__(self):
         return len(self.dataset)
@@ -132,6 +144,7 @@ class TranslationDataset(Dataset):
         src_text = item["translation"][self.src_lang]
         tgt_text = item["translation"][self.tgt_lang]
 
+        # 构造翻译提示词
         source_lang_full = "中文" if self.src_lang == "zh" else "英文"
         target_lang_full = "英文" if self.tgt_lang == "en" else "中文"
         prompt = (
@@ -140,56 +153,81 @@ class TranslationDataset(Dataset):
             f"只输出翻译结果：\n\n{src_text}"
         )
 
+        # 分词
         src_encoding = self.tokenizer(
-            prompt, max_length=self.max_seq_len, padding="max_length", truncation=True, return_tensors="pt"
+            prompt,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
         )
         tgt_encoding = self.tokenizer(
-            tgt_text, max_length=self.max_seq_len, padding="max_length", truncation=True, return_tensors="pt"
+            tgt_text,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
         )
 
+        # ✅ 统一输出格式 (遵循 DataFormat)
         return {
-            "idx": idx,
-            "src_input_ids": src_encoding["input_ids"].squeeze().to(dtype=torch.long),
-            "src_attention_mask": src_encoding["attention_mask"].squeeze().to(dtype=torch.long),
-            "tgt_input_ids": tgt_encoding["input_ids"].squeeze().to(dtype=torch.long),
-            "tgt_attention_mask": tgt_encoding["attention_mask"].squeeze().to(dtype=torch.long),
+            "id": idx,
             "src_text": src_text,
-            "tgt_text": tgt_text
+            "tgt_text": tgt_text,
+            "src_input_ids": src_encoding["input_ids"].squeeze(0).to(dtype=torch.long),
+            "src_attention_mask": src_encoding["attention_mask"].squeeze(0).to(dtype=torch.long),
+            "tgt_input_ids": tgt_encoding["input_ids"].squeeze(0).to(dtype=torch.long),
+            "tgt_attention_mask": tgt_encoding["attention_mask"].squeeze(0).to(dtype=torch.long),
+            "task_id": self.task_id
         }
 
-# 自定义 collate_fn
+
+# ==================== 自定义 collate_fn ====================
 def custom_collate_fn(batch, max_seq_len=64, pad_token_id=151643):
-    src_input_ids = [item["src_input_ids"] for item in batch]
-    src_attention_mask = [item["src_attention_mask"] for item in batch]
-    tgt_input_ids = [item["tgt_input_ids"] for item in batch]
-    tgt_attention_mask = [item["tgt_attention_mask"] for item in batch]
-    idx = [item["idx"] for item in batch]
+    """批次数据整理 (统一格式)"""
+    keys = ["id", "src_input_ids", "src_attention_mask", "tgt_input_ids", "tgt_attention_mask", "task_id"]
     src_texts = [item["src_text"] for item in batch]
     tgt_texts = [item["tgt_text"] for item in batch]
 
+    # Pad 序列
     src_input_ids = torch.nn.utils.rnn.pad_sequence(
-        src_input_ids, batch_first=True, padding_value=pad_token_id
+        [item["src_input_ids"] for item in batch],
+        batch_first=True,
+        padding_value=pad_token_id
     )[:, :max_seq_len].to(dtype=torch.long)
+
     src_attention_mask = torch.nn.utils.rnn.pad_sequence(
-        src_attention_mask, batch_first=True, padding_value=0
+        [item["src_attention_mask"] for item in batch],
+        batch_first=True,
+        padding_value=0
     )[:, :max_seq_len].to(dtype=torch.long)
+
     tgt_input_ids = torch.nn.utils.rnn.pad_sequence(
-        tgt_input_ids, batch_first=True, padding_value=pad_token_id
+        [item["tgt_input_ids"] for item in batch],
+        batch_first=True,
+        padding_value=pad_token_id
     )[:, :max_seq_len].to(dtype=torch.long)
+
     tgt_attention_mask = torch.nn.utils.rnn.pad_sequence(
-        tgt_attention_mask, batch_first=True, padding_value=0
+        [item["tgt_attention_mask"] for item in batch],
+        batch_first=True,
+        padding_value=0
     )[:, :max_seq_len].to(dtype=torch.long)
-    idx = torch.tensor(idx, dtype=torch.long)
+
+    task_ids = torch.tensor([item["task_id"] for item in batch], dtype=torch.long)
+    ids = torch.tensor([item["id"] for item in batch], dtype=torch.long)
 
     return {
-        "idx": idx,
+        "id": ids,
+        "src_text": src_texts,
+        "tgt_text": tgt_texts,
         "src_input_ids": src_input_ids,
         "src_attention_mask": src_attention_mask,
         "tgt_input_ids": tgt_input_ids,
         "tgt_attention_mask": tgt_attention_mask,
-        "src_text": src_texts,
-        "tgt_text": tgt_texts
+        "task_id": task_ids
     }
+
 
 # 验证 logits 文件
 def validate_logits_file(file_path, use_api=False, model_path=None):
@@ -215,7 +253,8 @@ def validate_logits_file(file_path, use_api=False, model_path=None):
             for item in data:
                 assert "id" in item and "task_id" in item, f"缺少id或task_id: {item}"
                 assert "src" in item and "ref" in item and "hyp" in item, f"缺少src/ref/hyp: {item}"
-                assert isinstance(item["src"], str) and isinstance(item["ref"], str) and isinstance(item["hyp"], str), f"src/ref/hyp类型错误: {item}"
+                assert isinstance(item["src"], str) and isinstance(item["ref"], str) and isinstance(item["hyp"],
+                                                                                                    str), f"src/ref/hyp类型错误: {item}"
             logging.info(f"✅ 验证通过！{file_path} 共 {count} 条有效记录（JSONL，API模式）")
         else:
             data = torch.load(file_path)
@@ -229,7 +268,8 @@ def validate_logits_file(file_path, use_api=False, model_path=None):
                     assert "logits" in item and item["logits"] is not None, f"缺少logits: {item}"
                     if vocab_size:
                         if item["logits"].shape[-1] != vocab_size:
-                            logging.warning(f"⚠️ logits维度不匹配 (预期: {vocab_size}, 实际: {item['logits'].shape[-1]})")
+                            logging.warning(
+                                f"⚠️ logits维度不匹配 (预期: {vocab_size}, 实际: {item['logits'].shape[-1]})")
                         else:
                             logging.debug(f"✅ logits维度验证通过: {item['logits'].shape}")
                     else:
@@ -240,18 +280,22 @@ def validate_logits_file(file_path, use_api=False, model_path=None):
         logging.error(f"❌ 验证失败: {e}")
         return 0
 
-# 生成 teacher logits
+
+# ==================== 生成 Teacher Logits (主函数) ====================
 def generate_teacher_logits(args):
     """
-    生成QWen-1.5-1.8B软标签（中→英，英→中），保存为.pt文件
-    优化：支持本地/API、批处理、FP16/INT8、max_seq_len=64
+    生成 QWen-1.5-1.8B 软标签 (中→英, 英→中)
+
+    改进点：
+    1. ✅ 统一数据格式 (遵循 DataFormat)
+    2. ✅ 分批保存，及时释放内存
+    3. ✅ 改进错误处理和日志
     """
     # 内存监控
     process = psutil.Process()
-    logging.debug(
-        f"初始内存使用: {process.memory_info().rss / 1024 ** 2:.2f} MB, 可用系统内存: {psutil.virtual_memory().available / 1024 ** 2:.2f} MB")
+    logging.info(f"初始内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
 
-    # 加载tokenizer
+    # 1. 加载 tokenizer
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             MODEL_PATH, local_files_only=True, trust_remote_code=True
@@ -259,40 +303,43 @@ def generate_teacher_logits(args):
         logging.info("✅ 成功加载 Qwen Tokenizer")
         logging.debug(f"加载tokenizer后内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
     except Exception as e:
-        logging.error(f"❌ 加载tokenizer失败: {e}")
+        logging.error(f"❌ Tokenizer加载失败: {e}")
         raise
 
     # 加载模型（本地或API）
     model = None
+    device = args.device
+
     if not args.use_api:
         try:
             check_model_files(MODEL_PATH)
-            logging.debug("开始加载 Qwen-1.5-1.8B 模型...")
+            logging.info(f"📥 加载 QWen-1.5-1.8B 模型到 {device}...")
             model = AutoModelForCausalLM.from_pretrained(
                 MODEL_PATH,
-                device_map=args.device,
-                torch_dtype=torch.float32,  # 使用 FP32 避免内存溢出
+                device_map=device,
+                torch_dtype=torch.float32,
                 local_files_only=True,
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
                 use_safetensors=True
             )
+
             if args.int8:
                 logging.debug("应用INT8量化...")
                 model = torch.quantization.quantize_dynamic(
                     model,
-                    qconfig_spec={
-                        torch.nn.Linear: torch.quantization.default_dynamic_qconfig,
-                        torch.nn.Embedding: torch.quantization.float_qparams_weight_only_qconfig
-                    },
+                    {nn.Linear, nn.Embedding},
                     dtype=torch.qint8
                 )
+                logging.info("✅ INT8量化已应用")
+
             model.eval()
-            if args.compile and args.device == "cuda":
+
+            if args.compile and device == "cuda":
                 model = torch.compile(model)
-            device = next(model.parameters()).device
-            logging.info(f"✅ 成功加载 Qwen-1.5-1.8B 到 {device}")
-            logging.debug(f"加载模型后内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
+                logging.info("✅ torch.compile已启用")
+
+            logging.info(f"✅ 模型加载完成 (内存: {process.memory_info().rss / 1024 ** 2:.2f} MB)")
         except Exception as e:
             logging.error(f"❌ 加载本地模型失败: {e}")
             if args.use_api:
@@ -302,155 +349,153 @@ def generate_teacher_logits(args):
     else:
         device = "cpu"
 
-    # 加载WMT19数据集
-    dataset_path = os.path.join(PROJECT_ROOT, args.dataset_path)
+    # 3. 加载数据集
     try:
-        dataset = load_dataset("parquet", data_files={"train": f"{dataset_path}/train/*.parquet"})["train"]
+        dataset_path = os.path.join(RAW_DATA_PATH, "train/*.parquet")
+        dataset = load_dataset("parquet", data_files={"train": dataset_path})["train"]
+
         if args.debug:
             dataset = dataset.select(range(1))
         logging.info(f"✅ 加载WMT19数据集，样本数: {len(dataset)}")
         logging.debug(f"加载数据集后内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
     except Exception as e:
-        logging.error(f"❌ 加载数据集失败: {e}")
+        logging.error(f"❌ 数据集加载失败: {e}")
         raise
 
-    # 设置样本范围和分片
+    # 4. 生成 logits (中→英, 英→中)
     total_samples = len(dataset) if args.max_samples is None else min(args.max_samples, len(dataset))
     shard_size = min(args.shard_size, total_samples)  # 确保分片大小合理
     num_shards = (total_samples + shard_size - 1) // shard_size
 
-    # 生成中→英和英→中
     success_count = 0
     for src_lang, tgt_lang, task_id, output_prefix in [
-        ("zh", "en", 0, os.path.join(OUTPUT_DIR, "zh_to_en")),
-        ("en", "zh", 1, os.path.join(OUTPUT_DIR, "en_to_zh"))
+        ("zh", "en", 0, os.path.join(TEACHER_LOGITS_DIR, "zh_to_en")),
+        ("en", "zh", 1, os.path.join(TEACHER_LOGITS_DIR, "en_to_zh"))
     ]:
-        logging.info(f"🧠 生成 {src_lang}→{tgt_lang} 软标签，分片大小: {shard_size}")
+        logging.info(f"🧠 生成 {src_lang}→{tgt_lang} logits (任务ID: {task_id})")
+
         for shard_idx in range(num_shards):
-            start_idx = shard_idx * shard_size
+            start_idx = args.start_from + shard_idx * shard_size
             end_idx = min(start_idx + shard_size, total_samples)
-            shard_dataset = dataset.select(range(args.start_from + start_idx, args.start_from + end_idx))
+            shard_dataset = dataset.select(range(start_idx, end_idx))
+
+            # 创建 DataLoader
             shard_dataloader = DataLoader(
-                TranslationDataset(shard_dataset, tokenizer, max_seq_len=args.max_seq_len, src_lang=src_lang,
-                                   tgt_lang=tgt_lang),
+                TranslationDataset(
+                    shard_dataset, tokenizer,
+                    max_seq_len=args.max_seq_len,
+                    src_lang=src_lang, tgt_lang=tgt_lang, task_id=task_id
+                ),
                 batch_size=args.batch_size,
                 shuffle=False,
                 num_workers=0,
-                pin_memory=(args.device == "cuda"),
-                collate_fn=lambda batch: custom_collate_fn(batch, max_seq_len=args.max_seq_len, pad_token_id=tokenizer.pad_token_id)
+                pin_memory=(device == "cuda"),
+                collate_fn=lambda b: custom_collate_fn(b, max_seq_len=args.max_seq_len,
+                                                       pad_token_id=tokenizer.pad_token_id)
             )
 
             output_file = f"{output_prefix}_shard_{shard_idx}.{'jsonl' if args.use_api else 'pt'}"
             output_data = []
 
-            if args.use_api:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    for batch_idx, batch in enumerate(
-                            tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {shard_idx}")):
-                        start_time = time.time()
-                        logging.debug(f"批次 {batch_idx + 1} 开始，内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
-
-                        idx = batch["idx"]
-                        src_texts = batch["src_text"]
-                        tgt_texts = batch["tgt_text"]
-
-                        try:
-                            for i in range(len(idx)):
-                                trans_text = call_qwen_translate_api(src_texts[i], tgt_lang)
-                                if trans_text:
-                                    item = {
-                                        "id": idx[i].item(),
-                                        "src": src_texts[i],
-                                        "ref": tgt_texts[i],
-                                        "hyp": trans_text,
-                                        "task_id": task_id,
-                                        "timestamp": time.time()
-                                    }
-                                    json.dump(item, f, ensure_ascii=False)
-                                    f.write('\n')
-                                    output_data.append(item)
-                                    success_count += 1
-                                else:
-                                    logging.warning(f"⚠️ API翻译失败: ID {idx[i].item()}")
-                            logging.info(
-                                f"批次 {batch_idx + 1}/{len(shard_dataloader)} 完成，耗时: {time.time() - start_time:.2f}s, 内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
-                        except Exception as e:
-                            logging.warning(f"⚠️ 批次 {batch_idx + 1} 处理失败: {e}")
-            else:
+            # 本地模式: 生成 logits
+            if not args.use_api:
                 with torch.no_grad():
                     for batch_idx, batch in enumerate(
                             tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {shard_idx}")):
-                        start_time = time.time()
-                        logging.debug(f"批次 {batch_idx + 1} 开始，内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
-
-                        idx = batch["idx"]
-                        src_texts = batch["src_text"]
-                        tgt_texts = batch["tgt_text"]
-                        src_input_ids = batch["src_input_ids"].to(device).to(dtype=torch.long)
-                        src_attention_mask = batch["src_attention_mask"].to(device).to(dtype=torch.long)
                         try:
+                            src_input_ids = batch["src_input_ids"].to(device)
+                            src_attention_mask = batch["src_attention_mask"].to(device)
+
+                            # 生成 logits
                             outputs = model(input_ids=src_input_ids, attention_mask=src_attention_mask)
-                            logits = outputs.logits  # [batch, seq_len, vocab_size]
-                            for i in range(len(idx)):
+                            logits = outputs.logits.cpu()  # 移回 CPU
+
+                            # ✅ 保存统一格式数据
+                            for i in range(len(batch["id"])):
                                 output_data.append({
-                                    "id": idx[i].item(),
-                                    "src_input_ids": src_input_ids[i].cpu().to(dtype=torch.long),
-                                    "src_attention_mask": src_attention_mask[i].cpu().to(dtype=torch.long),
-                                    "tgt_input_ids": batch["tgt_input_ids"][i].cpu().to(dtype=torch.long),
-                                    "tgt_attention_mask": batch["tgt_attention_mask"][i].cpu().to(dtype=torch.long),
-                                    "logits": logits[i].cpu(),
-                                    "task_id": task_id,
-                                    "src_text": src_texts[i],
-                                    "tgt_text": tgt_texts[i],
-                                    "hyp_text": None
+                                    "id": batch["id"][i].item(),
+                                    "src_text": batch["src_text"][i],
+                                    "tgt_text": batch["tgt_text"][i],
+                                    "src_input_ids": batch["src_input_ids"][i].cpu(),
+                                    "src_attention_mask": batch["src_attention_mask"][i].cpu(),
+                                    "tgt_input_ids": batch["tgt_input_ids"][i].cpu(),
+                                    "tgt_attention_mask": batch["tgt_attention_mask"][i].cpu(),
+                                    "task_id": batch["task_id"][i].item(),
+                                    "logits": logits[i]  # [seq_len, vocab_size]
                                 })
-                            success_count += len(idx)
-                            logging.info(
-                                f"批次 {batch_idx + 1}/{len(shard_dataloader)} 完成，耗时: {time.time() - start_time:.2f}s, 内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
+
+                            success_count += len(batch["id"])
+
+                            # ✅ 分批保存，释放内存 (每 10 batch)
+                            if (batch_idx + 1) % 10 == 0:
+                                gc.collect()
+                                if device == "cuda":
+                                    torch.cuda.empty_cache()
+
                         except Exception as e:
-                            logging.warning(f"⚠️ 批次 {batch_idx + 1} 处理失败: {e}")
+                            logging.error(f"❌ Batch {batch_idx} 处理失败: {e}")
+                            continue
 
-                        if args.device == "cuda":
-                            torch.cuda.empty_cache()
-                        # 释放 CPU 内存
-                        torch.cuda.empty_cache() if args.device == "cuda" else torch.cpu.empty_cache()
+            # API模式: 仅生成翻译文本
+            else:
+                for batch_idx, batch in enumerate(
+                        tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {shard_idx}")):
+                    for i in range(len(batch["id"])):
+                        hyp_text = call_qwen_translate_api(batch["src_text"][i], tgt_lang)
+                        if hyp_text:
+                            output_data.append({
+                                "id": batch["id"][i].item(),
+                                "src_text": batch["src_text"][i],
+                                "tgt_text": batch["tgt_text"][i],
+                                "src_input_ids": batch["src_input_ids"][i].cpu(),
+                                "src_attention_mask": batch["src_attention_mask"][i].cpu(),
+                                "tgt_input_ids": batch["tgt_input_ids"][i].cpu(),
+                                "tgt_attention_mask": batch["tgt_attention_mask"][i].cpu(),
+                                "task_id": batch["task_id"][i].item(),
+                                "logits": None,  # API模式无logits
+                                "hyp_text": hyp_text
+                            })
+                            success_count += 1
 
-                    torch.save(output_data, output_file)
+            # 保存分片
+            torch.save(output_data, output_file)
+            logging.info(f"💾 保存分片: {output_file} ({len(output_data)} 条)")
+            validate_logits_file(output_file)
 
-            logging.info(f"✅ {src_lang}→{tgt_lang} 分片 {shard_idx} 完成！成功: {success_count}, 保存到 {output_file}")
-            validate_logits_file(output_file, use_api=args.use_api, model_path=MODEL_PATH)
-            # 释放 output_data
-            output_data = []
-            import gc
+            # 释放内存
+            del output_data
             gc.collect()
 
-    # 释放模型内存
+    # 清理
     if model is not None:
         del model
-        torch.cuda.empty_cache() if args.device == "cuda" else torch.cpu.empty_cache()
         gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
-    return success_count, 0
+    logging.info(f"🎉 完成！成功: {success_count}")
+    return success_count
 
-# 主程序入口
+
+# ==================== 主程序 ====================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="生成 QWen-1.5-1.8B 软标签")
-    parser.add_argument("--dataset_path", type=str, default="data/raw/wmt19_zh_en", help="WMT19 数据集路径")
-    parser.add_argument("--batch_size", type=int, default=1, help="批处理大小")
-    parser.add_argument("--max_seq_len", type=int, default=64, help="最大序列长度")
-    parser.add_argument("--max_samples", type=int, default=None, help="最大样本数（None=全量）")
-    parser.add_argument("--start_from", type=int, default=0, help="开始样本索引")
-    parser.add_argument("--shard_size", type=int, default=100000, help="每片样本数（本地模式）")
-    parser.add_argument("--compile", action="store_true", help="使用 torch.compile 加速")
-    parser.add_argument("--int8", action="store_true", help="使用 INT8 量化（CPU）")
-    parser.add_argument("--debug", action="store_true", help="调试模式（1 条）")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="计算设备")
-    parser.add_argument("--use_api", action="store_true", help="使用 DashScope API（生成 jsonl）")
+    parser = argparse.ArgumentParser(description="生成 Teacher Logits (优化版)")
+    parser.add_argument("--dataset_path", type=str, default="data/raw/wmt19_zh_en", help="WMT19路径")
+    parser.add_argument("--batch_size", type=int, default=1, help="批大小")
+    parser.add_argument("--max_seq_len", type=int, default=ModelConfig.MAX_SEQ_LEN, help="最大序列长度")
+    parser.add_argument("--max_samples", type=int, default=None, help="最大样本数")
+    parser.add_argument("--start_from", type=int, default=0, help="起始索引")
+    parser.add_argument("--shard_size", type=int, default=100000, help="分片大小")
+    parser.add_argument("--compile", action="store_true", help="torch.compile")
+    parser.add_argument("--int8", action="store_true", help="INT8量化")
+    parser.add_argument("--debug", action="store_true", help="调试模式")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--use_api", action="store_true", help="使用API")
     args = parser.parse_args()
 
     try:
         success, fail = generate_teacher_logits(args)
         logging.info(f"🎉 处理完成！成功: {success}, 失败: {fail}")
     except Exception as e:
-        logging.error(f"❌ 主程序异常退出: {e}")
+        logging.error(f"❌ 程序异常: {e}")
         raise
