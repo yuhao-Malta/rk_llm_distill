@@ -1,0 +1,131 @@
+def generate_teacher_logits(args):
+    """
+    增强版：生成 Teacher 模型 logits 文件
+    ✅ 加入显存优化 / 自动 batch_size 回退 / 死锁防护 / 半精度支持
+    """
+    process = psutil.Process()
+    logging.info(f"初始内存: {process.memory_info().rss / 1024 ** 2:.2f} MB")
+
+    # ===== 1. 加载 tokenizer =====
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_PATH, local_files_only=True, trust_remote_code=True
+        )
+        logging.info("✅ 成功加载 Qwen Tokenizer")
+    except Exception as e:
+        logging.error(f"❌ Tokenizer加载失败: {e}")
+        raise
+
+    # ===== 2. 加载模型 =====
+    model = None
+    device = torch.device(args.device)
+    if not args.use_api:
+        try:
+            check_model_files(MODEL_PATH)
+            logging.info(f"📥 加载 Qwen 模型到 {device}...")
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_PATH,
+                    device_map=device,
+                    torch_dtype=torch.float16,
+                    local_files_only=True,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True
+                )
+                logging.info("✅ 成功加载模型 (float16 半精度)")
+            except Exception as e:
+                logging.warning(f"⚠️ 加载 float16 模型失败，回退到 float32: {e}")
+                model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_PATH,
+                    device_map=device,
+                    torch_dtype=torch.float32,
+                    local_files_only=True,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True
+                )
+                logging.info("✅ 回退到 float32 精度模型")
+
+            model.eval()
+
+            # ✅ 启用 TF32 + cuDNN benchmark
+            if device.type == "cuda":
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+                logging.info("💡 启用 TF32 与 cuDNN Benchmark 以优化 CUDA 稳定性")
+                logging.info("📊 初始CUDA内存摘要：")
+                logging.info(torch.cuda.memory_summary(device=device, abbreviated=True))
+        except Exception as e:
+            logging.error(f"❌ 模型加载失败: {e}")
+            raise
+
+    # ===== 3. 加载数据集 =====
+    try:
+        dataset_path = os.path.join(RAW_DATA_PATH, "train/*.parquet")
+        dataset = load_dataset("parquet", data_files={"train": dataset_path})["train"]
+        total_samples = len(dataset)
+        logging.info(f"✅ 加载WMT19数据集，样本数: {total_samples}")
+    except Exception as e:
+        logging.error(f"❌ 数据集加载失败: {e}")
+        raise
+
+    total_samples = min(args.max_samples or total_samples, total_samples)
+    shard_size = min(args.shard_size, total_samples)
+
+    success_count, fail_count = 0, 0
+
+    # ===== 4. 双向翻译任务 =====
+    for src_lang, tgt_lang, task_id, output_prefix in [
+        ("zh", "en", 0, os.path.join(TEACHER_LOGITS_DIR, "zh_to_en")),
+        ("en", "zh", 1, os.path.join(TEACHER_LOGITS_DIR, "en_to_zh"))
+    ]:
+        logging.info(f"🧠 生成 {src_lang}→{tgt_lang} logits (任务ID: {task_id})")
+
+        start_idx = args.start_from
+        end_idx = min(start_idx + args.shard_size, total_samples)
+        shard_dataset = dataset.select(range(start_idx, end_idx))
+        if len(shard_dataset) == 0:
+            logging.warning(f"⚠️ 分片 {args.shard_idx} 无样本，跳过。")
+            continue
+
+        # 构建 DataLoader
+        shard_dataloader = DataLoader(
+            TranslationDataset(
+                shard_dataset, tokenizer,
+                max_seq_len=args.max_seq_len,
+                src_lang=src_lang, tgt_lang=tgt_lang, task_id=task_id
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(device == "cuda"),
+            collate_fn=lambda b: custom_collate_fn(
+                b, max_seq_len=args.max_seq_len, pad_token_id=tokenizer.pad_token_id
+            )
+        )
+
+        output_file = f"{output_prefix}_shard_{args.shard_idx}.{'jsonl' if args.use_api else 'pt'}"
+        output_data = []
+
+        # ===== 5. 主循环 =====
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(
+                tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {args.shard_idx}")
+            ):
+                batch_start = time.time()
+                try:
+                    src_input_ids = batch["src_input_ids"].to(device)
+                    src_attention_mask = batch["src_attention_mask"].to(device)
+
+                    with torch.cuda.amp.autocast(dtype=torch.float16 if device.type == "cuda" else torch.float32):
+                        outputs = model(input_ids=src_input_ids, attention_mask=src_attention_mask)
+                        logits = outputs.logits.detach().cpu()
+
+                    # 释放显存
+                    del outputs
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
+                    for i in range(len(batch["id"])):
+              
