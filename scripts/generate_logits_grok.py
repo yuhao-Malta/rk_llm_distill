@@ -284,7 +284,8 @@ def validate_logits_file(file_path, use_api=False, model_path=None):
 # ==================== 生成 Teacher Logits (主函数) ====================
 def generate_teacher_logits(args):
     """
-    生成 QWen-1.5-1.8B 软标签 (中→英, 英→中)
+    生成 Teacher 模型的 logits 文件，用于学生模型蒸馏。
+    支持中→英 (task_id=0) 与 英→中 (task_id=1)。
 
     改进点：
     1. ✅ 统一数据格式 (遵循 DataFormat)
@@ -308,30 +309,55 @@ def generate_teacher_logits(args):
 
     # 加载模型（本地或API）
     model = None
-    device = args.device
+    device = torch.device(args.device)
 
     if not args.use_api:
         try:
             check_model_files(MODEL_PATH)
             logging.info(f"📥 加载 QWen-1.5-1.8B 模型到 {device}...")
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_PATH,
-                device_map=device,
-                torch_dtype=torch.float32,
-                local_files_only=True,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
-                use_safetensors=True
-            )
+            # 尝试加载半精度模型，显著降低显存占用
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_PATH,
+                    device_map=device,
+                    torch_dtype=torch.float16,  # 优先使用 FP16
+                    local_files_only=True,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True
+                )
+                logging.info("✅ 成功加载模型 (float16 半精度)")
+            except Exception as e:
+                logging.warning(f"⚠️ 加载 float16 模型失败，回退到 float32: {e}")
+                model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_PATH,
+                    device_map=device,
+                    torch_dtype=torch.float32,
+                    local_files_only=True,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True
+                )
+                logging.info("✅ 回退到 float32 精度模型")
 
             if args.int8:
-                logging.debug("应用INT8量化...")
-                model = torch.quantization.quantize_dynamic(
-                    model,
-                    {nn.Linear, nn.Embedding},
-                    dtype=torch.qint8
-                )
-                logging.info("✅ INT8量化已应用")
+                if device.type == "cpu":
+                    # ✅ CPU 模式启用动态量化
+                    logging.debug("应用INT8量化...")
+                    try:
+                        model = torch.quantization.quantize_dynamic(
+                            model,
+                            {nn.Linear},  # , nn.Embedding ✅ 禁用 Embedding 量化
+                            dtype=torch.qint8
+                        )
+                        logging.info("✅ INT8 动态量化启用 (Linear 层, CPU 模式)")
+                    except Exception as e:
+                        logging.warning(f"⚠️ INT8 量化失败, 使用原始 FP32 模型: {e}")
+                else:
+                    # ⚠️ GPU 不支持动态量化
+                    logging.warning("⚠️ CUDA 设备上不支持 torch.dynamic quantization，已自动禁用 INT8 量化。")
+            else:
+                logging.info("💡 未启用量化 (FP32/FP16 模式)")
 
             model.eval()
 
@@ -365,84 +391,97 @@ def generate_teacher_logits(args):
     # 4. 生成 logits (中→英, 英→中)
     total_samples = len(dataset) if args.max_samples is None else min(args.max_samples, len(dataset))
     shard_size = min(args.shard_size, total_samples)  # 确保分片大小合理
-    num_shards = (total_samples + shard_size - 1) // shard_size
 
     success_count = 0
+    fail_count = 0  # ✅ 初始化，防止未定义报错
     for src_lang, tgt_lang, task_id, output_prefix in [
         ("zh", "en", 0, os.path.join(TEACHER_LOGITS_DIR, "zh_to_en")),
         ("en", "zh", 1, os.path.join(TEACHER_LOGITS_DIR, "en_to_zh"))
     ]:
         logging.info(f"🧠 生成 {src_lang}→{tgt_lang} logits (任务ID: {task_id})")
 
-        for shard_idx in range(num_shards):
-            start_idx = args.start_from + shard_idx * shard_size
-            end_idx = min(start_idx + shard_size, total_samples)
-            shard_dataset = dataset.select(range(start_idx, end_idx))
+        start_idx = args.start_from
+        end_idx = min(start_idx + args.shard_size, total_samples)
+        shard_dataset = dataset.select(range(start_idx, end_idx))
 
-            # 创建 DataLoader
-            shard_dataloader = DataLoader(
-                TranslationDataset(
-                    shard_dataset, tokenizer,
-                    max_seq_len=args.max_seq_len,
-                    src_lang=src_lang, tgt_lang=tgt_lang, task_id=task_id
-                ),
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=0,
-                pin_memory=(device == "cuda"),
-                collate_fn=lambda b: custom_collate_fn(b, max_seq_len=args.max_seq_len,
-                                                       pad_token_id=tokenizer.pad_token_id)
-            )
+        if len(shard_dataset) == 0:
+            logging.warning(f"⚠️ 分片 {args.shard_idx} 无样本，跳过。")
+            continue
 
-            output_file = f"{output_prefix}_shard_{shard_idx}.{'jsonl' if args.use_api else 'pt'}"
-            output_data = []
+        # 创建 DataLoader
+        shard_dataloader = DataLoader(
+            TranslationDataset(
+                shard_dataset, tokenizer,
+                max_seq_len=args.max_seq_len,
+                src_lang=src_lang, tgt_lang=tgt_lang, task_id=task_id
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(device == "cuda"),
+            collate_fn=lambda b: custom_collate_fn(b, max_seq_len=args.max_seq_len,
+                                                   pad_token_id=tokenizer.pad_token_id)
+        )
 
-            # 本地模式: 生成 logits
-            if not args.use_api:
-                with torch.no_grad():
-                    for batch_idx, batch in enumerate(
-                            tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {shard_idx}")):
+        output_file = f"{output_prefix}_shard_{args.shard_idx}.{'jsonl' if args.use_api else 'pt'}"
+        output_data = []
+
+        # 本地模式: 生成 logits
+        if not args.use_api:
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(
+                        tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {args.shard_idx}")):
+                    try:
+                        src_input_ids = batch["src_input_ids"].to(device)
+                        src_attention_mask = batch["src_attention_mask"].to(device)
+
+                        # 生成 logits
                         try:
-                            src_input_ids = batch["src_input_ids"].to(device)
-                            src_attention_mask = batch["src_attention_mask"].to(device)
-
-                            # 生成 logits
                             outputs = model(input_ids=src_input_ids, attention_mask=src_attention_mask)
-                            logits = outputs.logits.cpu()  # 移回 CPU
+                            logits = outputs.logits.cpu()
 
-                            # ✅ 保存统一格式数据
-                            for i in range(len(batch["id"])):
-                                output_data.append({
-                                    "id": batch["id"][i].item(),
-                                    "src_text": batch["src_text"][i],
-                                    "tgt_text": batch["tgt_text"][i],
-                                    "src_input_ids": batch["src_input_ids"][i].cpu(),
-                                    "src_attention_mask": batch["src_attention_mask"][i].cpu(),
-                                    "tgt_input_ids": batch["tgt_input_ids"][i].cpu(),
-                                    "tgt_attention_mask": batch["tgt_attention_mask"][i].cpu(),
-                                    "task_id": batch["task_id"][i].item(),
-                                    "logits": logits[i]  # [seq_len, vocab_size]
-                                })
+                        except torch.cuda.OutOfMemoryError:
+                            logging.error(f"💥 CUDA OOM at batch {batch_idx}! 自动回退 batch_size...")
+                            torch.cuda.empty_cache()
 
-                            success_count += len(batch["id"])
-
-                            # ✅ 分批保存，释放内存 (每 10 batch)
-                            if (batch_idx + 1) % 10 == 0:
+                            # 自动减半 batch_size 并重建 dataloader
+                            if args.batch_size > 1:
+                                args.batch_size = max(1, args.batch_size // 2)
+                                logging.warning(f"⚙️ 新 batch_size={args.batch_size}，将重新构建 DataLoader 并继续")
                                 gc.collect()
-                                if device == "cuda":
-                                    torch.cuda.empty_cache()
+                                torch.cuda.empty_cache()
+                                # 重建 dataloader
+                                shard_dataloader = DataLoader(
+                                    TranslationDataset(
+                                        shard_dataset, tokenizer,
+                                        max_seq_len=args.max_seq_len,
+                                        src_lang=src_lang, tgt_lang=tgt_lang, task_id=task_id
+                                    ),
+                                    batch_size=args.batch_size,
+                                    shuffle=False,
+                                    num_workers=0,
+                                    pin_memory=(device == "cuda"),
+                                    collate_fn=lambda b: custom_collate_fn(b, max_seq_len=args.max_seq_len,
+                                                                           pad_token_id=tokenizer.pad_token_id)
+                                )
+                                break  # 当前 batch 退出循环，重新开始新的 dataloader
+                            else:
+                                logging.error("❌ 已降到 batch_size=1 仍显存不足，跳过该分片。")
+                                break
 
                         except Exception as e:
-                            logging.error(f"❌ Batch {batch_idx} 处理失败: {e}")
+                            logging.error(f"❌ 生成 logits 失败: {e}")
                             continue
 
-            # API模式: 仅生成翻译文本
-            else:
-                for batch_idx, batch in enumerate(
-                        tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {shard_idx}")):
-                    for i in range(len(batch["id"])):
-                        hyp_text = call_qwen_translate_api(batch["src_text"][i], tgt_lang)
-                        if hyp_text:
+                        # ✅ 模拟量化噪声 (仅在FP32时启用)
+                        if args.simulate_quant_noise and not args.int8:
+                            std = getattr(args, "noise_std", 0.01)
+                            noise = torch.randn_like(logits) * std
+                            logits += noise
+                            logging.debug(f"💡 已加入模拟量化噪声 (σ={std})")
+
+                        # ✅ 保存统一格式数据
+                        for i in range(len(batch["id"])):
                             output_data.append({
                                 "id": batch["id"][i].item(),
                                 "src_text": batch["src_text"][i],
@@ -452,19 +491,53 @@ def generate_teacher_logits(args):
                                 "tgt_input_ids": batch["tgt_input_ids"][i].cpu(),
                                 "tgt_attention_mask": batch["tgt_attention_mask"][i].cpu(),
                                 "task_id": batch["task_id"][i].item(),
-                                "logits": None,  # API模式无logits
-                                "hyp_text": hyp_text
+                                "logits": logits[i]  # [seq_len, vocab_size]
                             })
-                            success_count += 1
 
-            # 保存分片
-            torch.save(output_data, output_file)
-            logging.info(f"💾 保存分片: {output_file} ({len(output_data)} 条)")
-            validate_logits_file(output_file)
+                        success_count += len(batch["id"])
 
-            # 释放内存
-            del output_data
-            gc.collect()
+                        # ✅ 分批保存，释放内存 (每 10 batch)
+                        # if (batch_idx + 1) % 10 == 0:
+                        gc.collect()
+                        if device == "cuda":
+                            torch.cuda.empty_cache()
+
+                    except Exception as e:
+                        logging.error(f"❌ Batch {batch_idx} 处理失败: {e}")
+                        logging.error(
+                            f"⚠️ 问题批次示例: src_text={batch['src_text'][:1]}, tgt_text={batch['tgt_text'][:1]}")
+                        fail_count += len(batch)
+                        continue
+
+        # API模式: 仅生成翻译文本
+        else:
+            for batch_idx, batch in enumerate(
+                    tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {args.shard_idx}")):
+                for i in range(len(batch["id"])):
+                    hyp_text = call_qwen_translate_api(batch["src_text"][i], tgt_lang)
+                    if hyp_text:
+                        output_data.append({
+                            "id": batch["id"][i].item(),
+                            "src_text": batch["src_text"][i],
+                            "tgt_text": batch["tgt_text"][i],
+                            "src_input_ids": batch["src_input_ids"][i].cpu(),
+                            "src_attention_mask": batch["src_attention_mask"][i].cpu(),
+                            "tgt_input_ids": batch["tgt_input_ids"][i].cpu(),
+                            "tgt_attention_mask": batch["tgt_attention_mask"][i].cpu(),
+                            "task_id": batch["task_id"][i].item(),
+                            "logits": None,  # API模式无logits
+                            "hyp_text": hyp_text
+                        })
+                        success_count += 1
+
+        # 保存分片
+        torch.save(output_data, output_file)
+        logging.info(f"💾 保存分片: {output_file} ({len(output_data)} 条)")
+        validate_logits_file(output_file)
+
+        # 释放内存
+        del output_data
+        gc.collect()
 
     # 清理
     if model is not None:
@@ -473,8 +546,8 @@ def generate_teacher_logits(args):
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    logging.info(f"🎉 完成！成功: {success_count}")
-    return success_count
+    logging.info(f"🎉 完成！成功: {success_count} 失败: {fail_count}")
+    return success_count, fail_count
 
 
 # ==================== 主程序 ====================
@@ -491,6 +564,11 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="调试模式")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--use_api", action="store_true", help="使用API")
+    parser.add_argument("--simulate_quant_noise", action="store_true",
+                        help="是否在生成 logits 时加入模拟量化误差（增强学生鲁棒性）")
+    parser.add_argument("--noise_std", type=float, default=0.01,
+                        help="模拟量化噪声标准差 (默认 0.01)")
+    parser.add_argument("--shard_idx", type=int, default=0, help="当前分片索引（用于命名）")
     args = parser.parse_args()
 
     try:

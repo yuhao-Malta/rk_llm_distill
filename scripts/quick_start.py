@@ -7,6 +7,8 @@
 import os
 import sys
 
+import torch
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -133,48 +135,72 @@ def full_mode():
         logging.info("已取消")
         return False
 
-    # 协调式训练 (分片处理)
-    device = "cuda" if input("是否使用 GPU？(y/N): ").lower() == 'y' else "cpu"
-    batch_size = 16 if device == "cuda" else 4
+    # ======== GPU 设定 ========
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        logging.warning("⚠️ 未检测到 CUDA，将在 CPU 上运行（极慢！）")
 
-    if not run_command(
-            [
-                "python", "src/coordinate_distill.py",
-                "--max_samples", "26000000",
-                "--shard_size", "100000",
-                "--batch_size", str(batch_size),
-                "--device", device,
-                "--compile" if device == "cuda" else ""
-            ],
-            "协调式分片训练"
-    ):
+    # RTX 5090 32GB 推荐设置：
+    # - shard_size：10~20 万条一片
+    # - batch_size：32（AMP模式下）
+    # - compile：开启（torch.compile 可优化推理）
+    # - simulate_quant_noise：True 提升学生鲁棒性
+
+    max_samples = 10000
+    shard_size = 1000  # 约130个分片，训练效率和文件管理更平衡
+    batch_size = 2 if device == "cuda" else 4
+    noise_std = 0.01  # 模拟量化噪声强度
+
+    logging.info(
+        f"💡 参数设定: max_samples={max_samples:,}, shard_size={shard_size:,}, batch_size={batch_size}, device={device}")
+    batch_size = 16
+
+    # ======== 启动协调式蒸馏训练 ========
+    cmd = [
+        "python", "src/coordinate_distill.py",
+        "--dataset_path", "data/raw/wmt19_zh_en",
+        "--max_samples", str(max_samples),
+        "--shard_size", str(shard_size),
+        "--batch_size", str(batch_size),
+        "--device", device,
+        "--compile",
+        "--simulate_quant_noise",
+        "--noise_std", str(noise_std)
+    ]
+
+    if not run_command(cmd, "协调式分片蒸馏训练"):
         return False
 
-    # 量化模型
+    # ======== 模型量化 (INT8) ========
     if not run_command(
             ["python", "scripts/quantize_model.py"],
             "模型量化 (INT8)"
     ):
         return False
 
-    # 评估最终模型
-    for model_type in ["best", "int8"]:
-        model_path = f"outputs/models/student_model_{'amp_shard_0_' if model_type == 'best' else ''}{model_type}.pth"
-        if os.path.exists(model_path):
+    # ======== 评估阶段 ========
+    final_models = {
+        "best": "outputs/models/student_model_merged_best.pth",
+        "int8": "outputs/models/student_model_int8.pth"
+    }
+
+    for model_type, path in final_models.items():
+        if os.path.exists(path):
             run_command(
                 [
                     "python", "scripts/evaluate_model.py",
-                    "--model_path", model_path,
+                    "--model_path", path,
                     "--is_int8" if model_type == "int8" else "",
                     "--max_samples", "1000"
                 ],
                 f"评估 {model_type.upper()} 模型"
             )
 
-    logging.info("\n✅ 全量训练完成！")
-    logging.info("📊 模型文件:")
-    logging.info("  - FP32 模型: outputs/models/student_model_amp_shard_0_best.pth")
-    logging.info("  - INT8 模型: outputs/models/student_model_int8.pth")
+    logging.info("\n✅ 全量蒸馏流程完成！")
+    logging.info("📦 模型输出目录: outputs/models/")
+    logging.info("  - FP32 模型: student_model_merged_best.pth")
+    logging.info("  - INT8 模型: student_model_int8.pth")
+
     return True
 
 

@@ -77,6 +77,7 @@ class TinyTransformer(nn.Module):
         if self.vocab_size != actual_vocab_size:
             print(f"⚠️ 词汇表大小不匹配: 配置={self.vocab_size}, 实际={actual_vocab_size}")
             self.vocab_size = actual_vocab_size
+            ModelConfig.VOCAB_SIZE = actual_vocab_size
 
         # ==================== 模型层定义 ====================
         # 1. Token 嵌入层
@@ -277,6 +278,6 @@ if __name__ == "__main__":
     print(f"  输出形状: {outputs['logits'].shape}")
     print(f"  预期形状: ({batch_size}, {seq_len}, {ModelConfig.VOCAB_SIZE})")
 
-    # assert outputs['logits'].shape == (batch_size, seq_len, ModelConfig.VOCAB_SIZE)
+    assert outputs['logits'].shape == (batch_size, seq_len, ModelConfig.VOCAB_SIZE)
     # assert outputs['logits'].shape == (batch_size, seq_len, 151646)
     print("\n✅ 所有测试通过！")

@@ -7,8 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast
-from torch.cuda.amp import GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import logging
 
@@ -220,7 +219,7 @@ def train_distill_amp(
 
     # 4. 优化器 + AMP
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-    scaler = GradScaler(enabled=(device.type == "cuda" and TrainingConfig.USE_AMP))
+    scaler = GradScaler("cuda", enabled=(device.type == "cuda" and TrainingConfig.USE_AMP))
 
     # 5. 训练循环
     model.train()
@@ -346,6 +345,17 @@ def train_distill_amp(
         model_path = os.path.join(output_model_dir, f"student_model_amp_shard_{shard_idx}_epoch_{epoch + 1}.pth")
         torch.save(model.state_dict(), model_path)
         logging.info(f"💾 模型已保存: {model_path}")
+
+        # ✅ 仅保留最佳模型，立即删除当前epoch文件
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_model_path = os.path.join(output_model_dir, f"student_model_amp_shard_{shard_idx}_best.pth")
+            torch.save(model.state_dict(), best_model_path)
+            logging.info(f"🏆 新最佳模型已保存: {best_model_path}")
+        else:
+            # 删除当前epoch文件（非最佳）
+            os.remove(model_path)
+            logging.info(f"🗑️ 删除非最佳模型: {model_path}")
 
     logging.info("\n🎉 训练完成！")
     return best_model_path if best_loss < float('inf') else model_path
