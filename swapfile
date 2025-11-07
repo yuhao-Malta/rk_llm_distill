@@ -108,24 +108,106 @@ def generate_teacher_logits(args):
         output_file = f"{output_prefix}_shard_{args.shard_idx}.{'jsonl' if args.use_api else 'pt'}"
         output_data = []
 
-        # ===== 5. 主循环 =====
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(
+    # == == = 5. 主循环 == == =
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(
                 tqdm(shard_dataloader, desc=f"{src_lang}→{tgt_lang} 分片 {args.shard_idx}")
-            ):
-                batch_start = time.time()
-                try:
-                    src_input_ids = batch["src_input_ids"].to(device)
-                    src_attention_mask = batch["src_attention_mask"].to(device)
+        ):
+            batch_start = time.time()
+            try:
+                src_input_ids = batch["src_input_ids"].to(device)
+                src_attention_mask = batch["src_attention_mask"].to(device)
 
-                    with torch.cuda.amp.autocast(dtype=torch.float16 if device.type == "cuda" else torch.float32):
-                        outputs = model(input_ids=src_input_ids, attention_mask=src_attention_mask)
-                        logits = outputs.logits.detach().cpu()
+                with torch.cuda.amp.autocast(dtype=torch.float16 if device.type == "cuda" else torch.float32):
+                    outputs = model(input_ids=src_input_ids, attention_mask=src_attention_mask)
+                    logits = outputs.logits.detach().cpu()
 
-                    # 释放显存
-                    del outputs
+                # 释放显存
+                del outputs
+                torch.cuda.empty_cache()
+                gc.collect()
+
+                for i in range(len(batch["id"])):
+                    output_data.append({
+                        "id": batch["id"][i].item(),
+                        "src_text": batch["src_text"][i],
+                        "tgt_text": batch["tgt_text"][i],
+                        "src_input_ids": batch["src_input_ids"][i].cpu(),
+                        "src_attention_mask": batch["src_attention_mask"][i].cpu(),
+                        "tgt_input_ids": batch["tgt_input_ids"][i].cpu(),
+                        "tgt_attention_mask": batch["tgt_attention_mask"][i].cpu(),
+                        "task_id": batch["task_id"][i].item(),
+                        "logits": logits[i]
+                    })
+                success_count += len(batch["id"])
+
+                # 每 10 批次保存一次，防止过大
+                if (batch_idx + 1) % 10 == 0:
+                    torch.save(output_data, output_file)
+                    output_data.clear()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    logging.info(f"💾 临时保存 {output_file} (到第 {batch_idx + 1} 批次)")
+
+                # ⏱️ 超时检测 watchdog
+                elapsed = time.time() - batch_start
+                if elapsed > 120:
+                    logging.warning(f"⚠️ Batch {batch_idx} 超时 {elapsed:.1f}s，强制清理CUDA上下文")
                     torch.cuda.empty_cache()
                     gc.collect()
 
-                    for i in range(len(batch["id"])):
-              
+            except torch.cuda.OutOfMemoryError:
+                logging.error(f"💥 CUDA OOM at batch {batch_idx}! 自动回退 batch_size...")
+                torch.cuda.empty_cache()
+                if args.batch_size > 1:
+                    args.batch_size = max(1, args.batch_size // 2)
+                    logging.warning(f"⚙️ 新 batch_size={args.batch_size}，重新构建 DataLoader")
+                    shard_dataloader = DataLoader(
+                        TranslationDataset(
+                            shard_dataset, tokenizer,
+                            max_seq_len=args.max_seq_len,
+                            src_lang=src_lang, tgt_lang=tgt_lang, task_id=task_id
+                        ),
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=(device == "cuda"),
+                        collate_fn=lambda b: custom_collate_fn(
+                            b, max_seq_len=args.max_seq_len, pad_token_id=tokenizer.pad_token_id
+                        )
+                    )
+                    break
+                else:
+                    logging.error("❌ batch_size=1 仍显存不足，跳过该分片。")
+                    break
+
+            except RuntimeError as e:
+                logging.error(f"⚠️ RuntimeError (可能死锁或驱动错误): {e}")
+                torch.cuda.empty_cache()
+                gc.collect()
+                time.sleep(2)
+                continue
+
+            except Exception as e:
+                logging.error(f"❌ Batch {batch_idx} 处理失败: {e}")
+                torch.cuda.empty_cache()
+                gc.collect()
+                continue
+
+    # ===== 6. 保存结果并验证 =====
+    if len(output_data) > 0:
+        torch.save(output_data, output_file)
+    logging.info(f"💾 保存分片: {output_file}")
+    validate_logits_file(output_file)
+    del output_data
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ===== 7. 清理 =====
+    if model is not None:
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    logging.info(f"🎉 完成！成功: {success_count} 失败: {fail_count}")
+    return success_count, fail_count
