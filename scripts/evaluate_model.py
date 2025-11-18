@@ -12,8 +12,8 @@ import logging
 import sacrebleu
 from transformers import AutoTokenizer
 from datasets import load_dataset
-
-from models.tiny_transformer import TinyTransformer
+import torch.serialization
+from models.tiny_seq2seq_transformer import TinySeq2SeqTransformer as TinyTransformer
 from config.config import (
     ModelConfig, EvalConfig, LogConfig,
     MODEL_PATH, RAW_DATA_PATH
@@ -233,27 +233,49 @@ def main(
         logging.error(f"❌ Tokenizer 加载失败: {e}")
         raise
 
-    # 2. 加载模型
+    # ============================================================
+    # 2. 加载模型（支持 FP32 / INT8 / state_dict 模式）
+    # ============================================================
     try:
-        model = TinyTransformer(
-            vocab_size=ModelConfig.VOCAB_SIZE,
-            max_seq_len=ModelConfig.MAX_SEQ_LEN,
-            **ModelConfig.CURRENT_CONFIG
-        ).to(device)
+        logging.info("🚀 开始加载模型...")
 
-        # INT8 量化
         if is_int8:
-            model = torch.quantization.quantize_dynamic(
-                model, {nn.Embedding, nn.Linear}, dtype=torch.qint8
-            )
-            logging.info("✅ INT8 量化已应用")
+            logging.info("🔸 检测到 INT8 模型，使用安全白名单加载")
+            torch.serialization.add_safe_globals([TinyTransformer])
+            model = torch.load(model_path, map_location=device, weights_only=False)
+            # model.to(device)
+            # model.eval()
+            logging.info("✅ INT8 完整模型加载成功")
 
-        # 加载权重
-        state_dict = torch.load(model_path, map_location=device)
-        model.load_state_dict(state_dict, strict=not is_int8)
+        else:
+            # -------- FP32 模式 ----------
+            model = TinyTransformer(
+                vocab_size=ModelConfig.VOCAB_SIZE,
+                max_seq_len=ModelConfig.MAX_SEQ_LEN,
+                **ModelConfig.CURRENT_CONFIG
+            )
+            state_dict = torch.load(model_path, map_location=device)
+            model.load_state_dict(state_dict, strict=True)
+            logging.info("✅ FP32 模型权重加载成功")
+
+        # ============================================================
+        # 🔧 统一设备设置
+        # ============================================================
+        model.to(device)
         model.eval()
 
-        logging.info(f"✅ 模型加载成功 ({'INT8' if is_int8 else 'FP32'})")
+        # 修复 device 属性
+        if not hasattr(model, "device") or getattr(model, "device") is None:
+            try:
+                model.device = next(model.parameters()).device
+            except StopIteration:
+                model.device = torch.device("cpu")
+            logging.info(f"✅ 自动修复 model.device = {model.device}")
+        else:
+            logging.info(f"🔎 model.device = {model.device}")
+
+        logging.info("✅ 模型加载完成并已设置为评估模式")
+
     except Exception as e:
         logging.error(f"❌ 模型加载失败: {e}")
         raise

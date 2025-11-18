@@ -11,7 +11,8 @@ from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import logging
 
-from models.tiny_transformer import TinyTransformer
+# from models.tiny_transformer import TinyTransformer
+from models.tiny_seq2seq_transformer import TinySeq2SeqTransformer as TinyTransformer
 from config.config import (
     ModelConfig, TrainingConfig, DataFormat, LogConfig,
     MODEL_PATH, TEACHER_LOGITS_DIR, OUTPUT_MODEL_DIR, CACHE_DIR

@@ -46,32 +46,42 @@ class ModelConfig:
     
     VOCAB_SIZE = get_vocab_size.__func__()  # 静态调用
     MAX_SEQ_LEN = 64
-    
-    # TinyTransformer 参数配置 (可调)
+
+    # TinySeq2SeqTransformer 参数配置 (适配 encoder-decoder 架构)
+
     # 方案1: 极致压缩 (~10M 参数)
     TINY_CONFIG = {
         "d_model": 96,
         "nhead": 4,
-        "num_layers": 2,
+        "num_encoder_layers": 1,
+        "num_decoder_layers": 1,
+        "dim_feedforward": 192,
+        "dropout": 0.1,
         "share_weights": True
     }
-    
+
     # 方案2: 平衡方案 (~20M 参数) - 默认
     BALANCED_CONFIG = {
         "d_model": 128,
         "nhead": 4,
-        "num_layers": 2,
+        "num_encoder_layers": 2,
+        "num_decoder_layers": 2,
+        "dim_feedforward": 256,
+        "dropout": 0.1,
         "share_weights": True
     }
-    
+
     # 方案3: 性能优先 (~30M 参数)
     PERFORMANCE_CONFIG = {
         "d_model": 192,
         "nhead": 6,
-        "num_layers": 3,
+        "num_encoder_layers": 3,
+        "num_decoder_layers": 3,
+        "dim_feedforward": 512,
+        "dropout": 0.1,
         "share_weights": True
     }
-    
+
     # 当前使用的配置
     CURRENT_CONFIG = BALANCED_CONFIG
 

@@ -12,7 +12,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import time
 import subprocess
+import shutil
 import logging
 from config.config import get_config_summary
 
@@ -123,40 +125,94 @@ def small_mode():
 
 
 def full_mode():
-    """全量模式: 完整训练流程"""
-    logging.info("\n" + "=" * 60)
-    logging.info("🚀 全量模式: 完整训练流程")
-    logging.info("=" * 60)
-    logging.warning("⚠️ 全量训练需要大量时间和资源，建议在 GPU 服务器上运行")
+    """增强日志版：26M 全样本蒸馏 + 自动合并 + 量化 + 评估 + GPU监控"""
+    logging.info("\n" + "=" * 80)
+    logging.info("🚀 全量模式: 26M 样本蒸馏训练（增强日志版）")
+    logging.info("=" * 80)
+    logging.warning("⚠️ 请确保磁盘可用空间 ≥ 1TB，训练过程持续数小时")
 
-    # 确认
-    response = input("\n是否继续？(y/N): ")
+    # ======== 用户确认 ========
+    response = input("\n是否继续执行全量蒸馏训练？(y/N): ")
     if response.lower() != 'y':
-        logging.info("已取消")
+        logging.info("❌ 用户取消全量训练")
         return False
 
-    # ======== GPU 设定 ========
+    # ======== 环境设定 ========
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         logging.warning("⚠️ 未检测到 CUDA，将在 CPU 上运行（极慢！）")
 
-    # RTX 5090 32GB 推荐设置：
-    # - shard_size：10~20 万条一片
-    # - batch_size：32（AMP模式下）
-    # - compile：开启（torch.compile 可优化推理）
-    # - simulate_quant_noise：True 提升学生鲁棒性
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "full_mode_run.log")
 
-    max_samples = 10000
-    shard_size = 1000  # 约130个分片，训练效率和文件管理更平衡
-    batch_size = 2 if device == "cuda" else 4
-    noise_std = 0.01  # 模拟量化噪声强度
+    # ======== 参数配置 ========
+    max_samples = 26_000_000
+    shard_size = 100_000
+    batch_size = 8
+    noise_std = 0.01
 
-    logging.info(
-        f"💡 参数设定: max_samples={max_samples:,}, shard_size={shard_size:,}, batch_size={batch_size}, device={device}")
-    batch_size = 16
+    logging.info(f"💡 参数设定:")
+    logging.info(f"   max_samples = {max_samples:,}")
+    logging.info(f"   shard_size  = {shard_size:,}")
+    logging.info(f"   batch_size  = {batch_size}")
+    logging.info(f"   device      = {device}")
+    logging.info(f"   noise_std   = {noise_std}")
+    logging.info(f"   日志文件    = {log_file}")
 
-    # ======== 启动协调式蒸馏训练 ========
-    cmd = [
+    # ======== 辅助函数 ========
+    def gpu_status():
+        """读取当前 GPU 状态"""
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw", "--format=csv,noheader,nounits"],
+                text=True
+            ).strip().split("\n")[0]
+            temp, util, mem_used, mem_total, power = map(float, out.split(", "))
+            return f"GPU {util:.0f}% | Mem {mem_used:.0f}/{mem_total:.0f} MB | Temp {temp:.0f}°C | Power {power:.0f}W"
+        except Exception:
+            return "GPU 状态不可用"
+
+    def log_and_time(cmd, desc):
+        """执行命令并计时 + GPU监控"""
+        logging.info(f"\n{'=' * 80}")
+        logging.info(f"🚀 开始: {desc}")
+        logging.info(f"{'=' * 80}")
+        logging.info(f"命令: {' '.join(cmd)}")
+
+        start_time = time.time()
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n\n===== {desc} =====\n命令: {' '.join(cmd)}\n")
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            peak_mem = 0
+            for line in proc.stdout:
+                line_stripped = line.strip()
+                if "CUDA out of memory" in line_stripped:
+                    logging.error("💥 检测到 OOM 错误！")
+                if "MiB" in line_stripped and "allocated" in line_stripped:
+                    try:
+                        mem_val = int(line_stripped.split("MiB")[0].split()[-1])
+                        peak_mem = max(peak_mem, mem_val)
+                    except:
+                        pass
+                if time.time() % 60 < 1:  # 每分钟记录一次GPU状态
+                    logging.info("📊 GPU监控: " + gpu_status())
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+            proc.wait()
+            end_time = time.time()
+            elapsed_min = (end_time - start_time) / 60
+            logging.info(f"✅ {desc} 完成，用时 {elapsed_min:.1f} 分钟")
+            logging.info(f"📈 峰值显存约: {peak_mem} MiB")
+            return True
+        except Exception as e:
+            logging.error(f"❌ {desc} 失败: {e}")
+            return False
+
+    # ======== Step 1: 协调式蒸馏训练 ========
+    cmd_train = [
         "python", "src/coordinate_distill.py",
         "--dataset_path", "data/raw/wmt19_zh_en",
         "--max_samples", str(max_samples),
@@ -167,42 +223,61 @@ def full_mode():
         "--simulate_quant_noise",
         "--noise_std", str(noise_std)
     ]
-
-    if not run_command(cmd, "协调式分片蒸馏训练"):
+    if not log_and_time(cmd_train, "协调式分片蒸馏训练"):
         return False
 
-    # ======== 模型量化 (INT8) ========
-    if not run_command(
-            ["python", "scripts/quantize_model.py"],
-            "模型量化 (INT8)"
-    ):
+    # ======== Step 2: 模型量化 (INT8) ========
+    cmd_quant = [
+        "python", "scripts/quantize_model.py",
+        "--input_model", "outputs/models/student_model_final_merged.pth",
+        "--output_model", "outputs/models/student_model_int8.pth",
+        "--report_path", "logs/quantization_report.txt"
+    ]
+    if not log_and_time(cmd_quant, "模型量化 (INT8)"):
         return False
 
-    # ======== 评估阶段 ========
-    final_models = {
-        "best": "outputs/models/student_model_merged_best.pth",
-        "int8": "outputs/models/student_model_int8.pth"
+    # ======== Step 3: 模型评估 ========
+    models_to_eval = {
+        "FP32": "outputs/models/student_model_final_merged.pth",
+        "INT8": "outputs/models/student_model_int8.pth"
     }
 
-    for model_type, path in final_models.items():
-        if os.path.exists(path):
-            run_command(
-                [
-                    "python", "scripts/evaluate_model.py",
-                    "--model_path", path,
-                    "--is_int8" if model_type == "int8" else "",
-                    "--max_samples", "1000"
-                ],
-                f"评估 {model_type.upper()} 模型"
-            )
+    for model_name, model_path in models_to_eval.items():
+        if os.path.exists(model_path):
+            cmd_eval = [
+                "python", "scripts/evaluate_model.py",
+                "--model_path", model_path,
+                "--max_samples", "1000"
+            ]
+            if "INT8" in model_name:
+                cmd_eval.append("--is_int8")
+            log_and_time(cmd_eval, f"评估 {model_name} 模型")
+        else:
+            logging.warning(f"⚠️ 未找到模型: {model_path}")
 
-    logging.info("\n✅ 全量蒸馏流程完成！")
+    # ======== Step 4: 汇总报告 ========
+    report_path = os.path.join(log_dir, "distill_run_report.txt")
+    with open(report_path, "w", encoding="utf-8") as rpt:
+        rpt.write("=== RK-LLM Distillation 全流程报告 ===\n")
+        rpt.write(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        rpt.write(f"总样本数: {max_samples:,}\n")
+        rpt.write(f"分片大小: {shard_size:,}\n")
+        rpt.write(f"批量大小: {batch_size}\n")
+        rpt.write(f"噪声强度: {noise_std}\n")
+        rpt.write(f"设备: {device}\n")
+        rpt.write(f"GPU 状态: {gpu_status()}\n")
+        rpt.write(f"\n输出模型:\n")
+        for model_name, model_path in models_to_eval.items():
+            rpt.write(f"  - {model_name}: {model_path}\n")
+        rpt.write("\n查看完整日志: logs/full_mode_run.log\n")
+
+    logging.info("\n✅ 全流程完成！详细报告已保存:")
+    logging.info(f"📄 {report_path}")
+    logging.info("📊 日志文件:")
+    logging.info(f"   {log_file}")
     logging.info("📦 模型输出目录: outputs/models/")
-    logging.info("  - FP32 模型: student_model_merged_best.pth")
-    logging.info("  - INT8 模型: student_model_int8.pth")
 
     return True
-
 
 def main():
     """主函数"""
