@@ -5,6 +5,7 @@
 """
 import os
 import json
+from transformers import AutoTokenizer
 
 # ==================== 路径配置 ====================
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,23 +33,25 @@ for path in [TEACHER_LOGITS_DIR, CACHE_DIR, OUTPUT_MODEL_DIR, OUTPUT_LOGS_DIR]:
 # ==================== 模型配置 ====================
 class ModelConfig:
     """学生模型配置"""
-    # 从 Qwen config.json 动态读取词汇表大小
     @staticmethod
-    def get_vocab_size():
-        config_path = os.path.join(MODEL_PATH, "config.json")
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            return config.get("vocab_size", 151936)
-        except Exception as e:
-            print(f"⚠️ 读取 config.json 失败: {e}，使用默认值 151936")
-            return 151936
-    
-    VOCAB_SIZE = get_vocab_size.__func__()  # 静态调用
+    def get_vocab_size_from_teacher():
+        """优先读取教师模型 tokenizer 的词表大小"""
+        for path in [OPUS_MT_ZH_EN, OPUS_MT_EN_ZH]:
+            try:
+                tok = AutoTokenizer.from_pretrained(path, local_files_only=True)
+                vocab_size = len(tok)
+                print(f"✅ 从教师模型加载词表大小: {vocab_size} ({path})")
+                return vocab_size
+            except Exception as e:
+                print(f"⚠️ 加载教师模型词表失败: {e}，跳过 {path}")
+        print("⚠️ 所有教师模型加载失败，使用默认词表大小 65001")
+        return 65001
+
+    # ✅ 这里不需要传参了
+    VOCAB_SIZE = get_vocab_size_from_teacher.__func__()
     MAX_SEQ_LEN = 64
 
     # TinySeq2SeqTransformer 参数配置 (适配 encoder-decoder 架构)
-
     # 方案1: 极致压缩 (~10M 参数)
     TINY_CONFIG = {
         "d_model": 96,
